@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -964,6 +965,57 @@ _CONFIGS = [
                 action_expert_variant="gemma_300m_lora",
             ).get_freeze_filter(),
             # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+        )
+        for _task in ("set_table", "prepare_tray", "cooking")
+    ],
+    #
+    # Same three tasks, but training *only* the action expert: the vision tower
+    # and the PaliGemma LLM are frozen, leaving the 300M expert plus the small
+    # state/action projection heads trainable.
+    #
+    # Cheaper than the LoRA variants above rather than more expensive. scripts/train.py
+    # casts everything matched by freeze_filter to bfloat16 and inits the optimizer
+    # state only over trainable_filter, so a bigger frozen set is a smaller
+    # footprint. It also removes the reason LoRA is expensive here: LoRA adapters
+    # live *inside* the 2B LLM, so backward has to traverse it, whereas with the
+    # whole prefix tower frozen the image/prompt pass carries no gradient.
+    #
+    # Unlike the LoRA variants there is no get_freeze_filter() preset for this,
+    # so the filter is spelled out. Paths look like "PaliGemma/llm/..." and
+    # "PaliGemma/img/..."; within the LLM the action expert is the "_1" stack
+    # (the same convention get_freeze_filter uses).
+    *[
+        TrainConfig(
+            name=f"pi05_droid_{_task}_actexp",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=16,
+            ),
+            data=LeRobotDROIDDataConfig(
+                repo_id=f"src_lab/droid_{_task}",
+                base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                    asset_id="droid",
+                ),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
+            ),
+            num_train_steps=20_000,
+            # Starting point, not a measured ceiling -- see docs/openpi_droid_finetune.md.
+            batch_size=8,
+            freeze_filter=nnx.Any(
+                # Whole vision tower.
+                nnx_utils.PathRegex(".*img.*"),
+                # LLM minus the action expert.
+                nnx.All(
+                    nnx_utils.PathRegex(".*llm.*"),
+                    nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),
+                ),
+            ),
             ema_decay=None,
         )
         for _task in ("set_table", "prepare_tray", "cooking")
