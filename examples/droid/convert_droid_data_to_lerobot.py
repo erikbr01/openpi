@@ -8,6 +8,32 @@ If you want to push your dataset to the Hugging Face Hub, you can use the follow
 uv run examples/droid/convert_droid_data_to_lerobot.py --data_dir /path/to/your/data --push_to_hub
 
 The resulting dataset will get saved to the $LEROBOT_HOME directory.
+
+Local-lab deviations from the upstream example (all opt-in via flags, the
+default path is unchanged):
+
+  --repo-name    name the output dataset instead of editing REPO_NAME.
+  --task-filter  keep only episodes whose task is one of these. Our raw sessions
+                 are laid out by *date*, not by task, and a single day often
+                 mixes tasks, so a date directory is not a dataset. Takes
+                 several strings because one task spans variants (set_table is
+                 "prepare plate - milk right" + "... - milk middle").
+  --max-episodes stop after N episodes (smoke tests).
+
+Language instructions come from the ``current_task`` attribute on each
+``trajectory.h5`` (that is where the DROID GUI records the operator's task
+string), not from ``aggregated-annotations-030724.json`` -- locally collected
+sessions have no entry in the public annotation dump and no ``metadata_*.json``
+sidecar to key into it with. Pass --annotations-file to restore the upstream
+behaviour.
+
+Camera handling also tolerates rigs with a single exterior camera: upstream
+hard-indexes ``exterior_ids[1]``, but our rig records one wrist + one exterior
+ZED, and the h5 additionally lists cameras that were connected but never
+recorded an SVO. Cameras are intersected with the frames actually decoded, and
+a missing ``exterior_image_2_left`` is zero-filled. That view is unused by
+``DroidInputs`` (pi0/pi0.5 read only exterior_1 + wrist), so zero-filling costs
+nothing at training time.
 """
 
 from collections import defaultdict
@@ -34,9 +60,23 @@ def resize_image(image, size):
     return np.array(image.resize(size, resample=Image.BICUBIC))
 
 
-def main(data_dir: str, *, push_to_hub: bool = False):
+def episode_task(episode_path: Path) -> str:
+    """The operator-entered task string the DROID GUI stamps onto each recording."""
+    with h5py.File(episode_path, "r") as f:
+        return str(f.attrs.get("current_task", "")).strip()
+
+
+def main(
+    data_dir: str,
+    *,
+    push_to_hub: bool = False,
+    repo_name: str = REPO_NAME,
+    task_filter: list[str] | None = None,
+    max_episodes: int | None = None,
+    annotations_file: str | None = None,
+):
     # Clean up any existing dataset in the output directory
-    output_path = HF_LEROBOT_HOME / REPO_NAME
+    output_path = HF_LEROBOT_HOME / repo_name
     if output_path.exists():
         shutil.rmtree(output_path)
     data_dir = Path(data_dir)
@@ -45,7 +85,7 @@ def main(data_dir: str, *, push_to_hub: bool = False):
     # We will follow the DROID data naming conventions here.
     # LeRobot assumes that dtype of image data is `image`
     dataset = LeRobotDataset.create(
-        repo_id=REPO_NAME,
+        repo_id=repo_name,
         robot_type="panda",
         fps=15,  # DROID data is typically recorded at 15fps
         features={
@@ -87,8 +127,10 @@ def main(data_dir: str, *, push_to_hub: bool = False):
 
     # Load language annotations
     # Note: we load the DROID language annotations for this example, but you can manually define them for your own data
-    with (data_dir / "aggregated-annotations-030724.json").open() as f:
-        language_annotations = json.load(f)
+    language_annotations = {}
+    if annotations_file is not None:
+        with Path(annotations_file).open() as f:
+            language_annotations = json.load(f)
 
     # Loop over raw DROID fine-tuning datasets and write episodes to the LeRobot dataset
     # We assume the following directory structure:
@@ -99,8 +141,17 @@ def main(data_dir: str, *, push_to_hub: bool = False):
     #          - <camera_id>.mp4  # single-view video of left stereo pair camera
     #     - trajectory.hdf5
     #   - <...>/
-    episode_paths = list(data_dir.glob("**/trajectory.h5"))
+    # Sorted so a --max-episodes run is reproducible rather than filesystem-order.
+    episode_paths = sorted(data_dir.glob("**/trajectory.h5"))
+    if task_filter is not None:
+        wanted = set(task_filter)
+        episode_paths = [p for p in episode_paths if episode_task(p) in wanted]
+        print(f"Task filter {task_filter} matched {len(episode_paths)} episodes")
+    if max_episodes is not None:
+        episode_paths = episode_paths[:max_episodes]
     print(f"Found {len(episode_paths)} episodes for conversion")
+    if not episode_paths:
+        raise SystemExit(f"No episodes to convert under {data_dir} (task_filter={task_filter!r})")
 
     # We will loop over each dataset_name and write episodes to the LeRobot dataset
     for episode_path in tqdm(episode_paths, desc="Converting episodes"):
@@ -108,29 +159,47 @@ def main(data_dir: str, *, push_to_hub: bool = False):
         recording_folderpath = episode_path.parent / "recordings" / "MP4"
         trajectory = load_trajectory(str(episode_path), recording_folderpath=str(recording_folderpath))
 
-        # To load the language instruction, we need to parse out the episode_id from the metadata file
-        # Again, you can modify this step for your own data, to load your own language instructions
-        metadata_filepath = next(iter(episode_path.parent.glob("metadata_*.json")))
-        episode_id = metadata_filepath.name.split(".")[0].split("_")[-1]
-        language_instruction = language_annotations.get(episode_id, {"language_instruction1": "Do something"})[
-            "language_instruction1"
-        ]
+        # Language instruction. Upstream keys the public annotation dump by the
+        # episode id in metadata_*.json; locally collected sessions have neither,
+        # so fall back to the task string the DROID GUI wrote into the h5.
+        language_instruction = None
+        if language_annotations:
+            metadata_files = sorted(episode_path.parent.glob("metadata_*.json"))
+            if metadata_files:
+                episode_id = metadata_files[0].name.split(".")[0].split("_")[-1]
+                annotation = language_annotations.get(episode_id)
+                if annotation is not None:
+                    language_instruction = annotation["language_instruction1"]
+        if language_instruction is None:
+            language_instruction = episode_task(episode_path) or "Do something"
         print(f"Converting episode with language instruction: {language_instruction}")
 
         # Write to LeRobot dataset
         for step in trajectory:
-            camera_type_dict = step["observation"]["camera_type"]
+            # camera_type lists every camera the controller knew about, including
+            # ones that never recorded an SVO -- keep only those we actually decoded.
+            decoded = step["observation"]["image"]
+            camera_type_dict = {k: v for k, v in step["observation"]["camera_type"].items() if k in decoded}
             wrist_ids = [k for k, v in camera_type_dict.items() if v == 0]
             exterior_ids = [k for k, v in camera_type_dict.items() if v != 0]
+            if not wrist_ids or not exterior_ids:
+                raise ValueError(
+                    f"{episode_path}: need >=1 wrist and >=1 exterior camera, "
+                    f"decoded {sorted(decoded)} with types {camera_type_dict}"
+                )
+            exterior_2 = (
+                resize_image(decoded[exterior_ids[1]][..., ::-1], (320, 180))
+                if len(exterior_ids) > 1
+                # Single-exterior rig. Unused by DroidInputs, so zero-fill.
+                else np.zeros((180, 320, 3), dtype=np.uint8)
+            )
             dataset.add_frame(
                 {
                     # Note: need to flip BGR --> RGB for loaded images
                     "exterior_image_1_left": resize_image(
                         step["observation"]["image"][exterior_ids[0]][..., ::-1], (320, 180)
                     ),
-                    "exterior_image_2_left": resize_image(
-                        step["observation"]["image"][exterior_ids[1]][..., ::-1], (320, 180)
-                    ),
+                    "exterior_image_2_left": exterior_2,
                     "wrist_image_left": resize_image(step["observation"]["image"][wrist_ids[0]][..., ::-1], (320, 180)),
                     "joint_position": np.asarray(
                         step["observation"]["robot_state"]["joint_positions"], dtype=np.float32

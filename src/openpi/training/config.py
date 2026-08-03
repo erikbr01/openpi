@@ -917,6 +917,58 @@ _CONFIGS = [
         batch_size=32,
     ),
     #
+    # SRC lab DROID tasks: pi05-DROID LoRA fine-tunes, one per task.
+    #
+    # Sized for a single 24 GB RTX 4090 (see the memory table in README.md: LoRA
+    # needs >22.5 GB, full fine-tuning >70 GB, so full is not an option here).
+    # Datasets are built by examples/droid/convert_droid_data_to_lerobot.py with
+    # --task-filter; the repo_id below must match the --repo-name used there.
+    #
+    # Norm stats are reused from the pi05_droid release rather than recomputed:
+    # our data is DROID, on a Panda, at 15 fps, with joint-velocity actions, so
+    # the pre-training statistics apply and reusing them keeps the fine-tune in
+    # the action space the base checkpoint was trained on (see docs/norm_stats.md).
+    # That also means scripts/compute_norm_stats.py is NOT required for these.
+    *[
+        TrainConfig(
+            name=f"pi05_droid_{_task}_lora",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,  # pi05 is trained with 32-dim actions
+                action_horizon=16,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotDROIDDataConfig(
+                repo_id=f"src_lab/droid_{_task}",
+                base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(
+                    # Important: reuse the original DROID norm stats during fine-tuning!
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                    asset_id="droid",
+                ),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
+            ),
+            num_train_steps=20_000,
+            # batch 4 on one 4090. The 24 GB budget is what forces this; raise it
+            # (and drop the gradient-accumulation-free assumption) on bigger cards.
+            batch_size=4,
+            # Must match the model config above, or the wrong parameters get frozen.
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=16,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+        )
+        for _task in ("set_table", "prepare_tray", "cooking")
+    ],
+    #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(
